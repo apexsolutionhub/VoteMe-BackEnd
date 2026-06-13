@@ -57,6 +57,21 @@ class Competition(models.Model):
     tracking_interval_minutes = models.PositiveSmallIntegerField(default=10)
     start_at = models.DateTimeField(null=True, blank=True)
     end_at = models.DateTimeField(null=True, blank=True)
+    class CommentScoringMode(models.TextChoices):
+        ALL = "all", "All comments"
+        MATCHED = "matched", "Matching comments only"
+
+    comment_scoring_mode = models.CharField(
+        max_length=20,
+        choices=CommentScoringMode.choices,
+        default=CommentScoringMode.ALL,
+        help_text="Whether comment scoring uses every comment or only matched ones.",
+    )
+    comment_match_terms = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Optional triggers such as ["@ellaresort", "#ellaresort"].',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -67,6 +82,14 @@ class Competition(models.Model):
         return f"{self.title} ({self.organization.slug})"
 
     def get_scoring_weights(self) -> dict[str, float]:
+        from competitions.criteria import build_scoring_weights
+
+        if self.criteria.filter(
+            kind=CompetitionCriterion.Kind.METRIC,
+            is_active=True,
+        ).exists():
+            return build_scoring_weights(self)
+
         defaults = {
             "views": 1.0,
             "likes": 3.0,
@@ -83,6 +106,88 @@ class Competition(models.Model):
             except (TypeError, ValueError):
                 continue
         return merged
+
+    def get_comment_match_terms(self) -> list[str]:
+        from competitions.comment_mentions import normalize_comment_match_terms
+
+        return normalize_comment_match_terms(self.comment_match_terms)
+
+    def uses_matched_comment_scoring(self) -> bool:
+        return (
+            self.comment_scoring_mode == self.CommentScoringMode.MATCHED
+            and bool(self.get_comment_match_terms())
+        )
+
+
+class CompetitionCriterion(models.Model):
+    class Kind(models.TextChoices):
+        MILESTONE = "milestone", "Milestone"
+        METRIC = "metric", "Scoring metric"
+
+    class EvaluationMode(models.TextChoices):
+        ABSOLUTE = "absolute", "Fixed target"
+        RELATIVE = "relative", "Relative to field"
+
+    class MetricKey(models.TextChoices):
+        VIEWS = "views", "Views"
+        LIKES = "likes", "Likes"
+        COMMENTS = "comments", "Comments"
+        SHARES = "shares", "Shares"
+        BRAND_MENTIONS = "brand_mentions", "Brand mentions"
+        VIDEO_COUNT = "video_count", "Video count"
+        PROFILE_COMPLETE = "profile_complete", "Profile complete"
+        ENGAGEMENT_SCORE = "engagement_score", "Engagement score"
+        RANK = "rank", "Leaderboard rank"
+
+    class WeightInputType(models.TextChoices):
+        NUMBER = "number", "Number"
+        PERCENTAGE = "percentage", "Percentage"
+        WORD = "word", "Word"
+
+    competition = models.ForeignKey(
+        Competition,
+        on_delete=models.CASCADE,
+        related_name="criteria",
+    )
+    kind = models.CharField(max_length=20, choices=Kind.choices)
+    metric_key = models.CharField(max_length=40, choices=MetricKey.choices)
+    evaluation_mode = models.CharField(
+        max_length=20,
+        choices=EvaluationMode.choices,
+        default=EvaluationMode.ABSOLUTE,
+    )
+    title = models.CharField(max_length=120)
+    description = models.TextField(blank=True, default="")
+    target_value = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Fixed target for absolute milestones.",
+    )
+    weight_value = models.FloatField(
+        default=0,
+        help_text="Numeric weight or percentage value for scoring metrics.",
+    )
+    weight_input_type = models.CharField(
+        max_length=20,
+        choices=WeightInputType.choices,
+        default=WeightInputType.NUMBER,
+    )
+    weight_display = models.CharField(
+        max_length=40,
+        blank=True,
+        default="",
+        help_text='Raw admin input such as "30%", "high", or "5".',
+    )
+    sort_order = models.PositiveSmallIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "id"]
+
+    def __str__(self) -> str:
+        return f"{self.title} ({self.kind})"
 
 
 class CandidateProfile(models.Model):
@@ -136,13 +241,28 @@ class CompetitionVideo(models.Model):
     )
     url = models.URLField()
     platform_video_id = models.CharField(max_length=120, blank=True, default="")
+    title = models.CharField(max_length=500, blank=True, default="")
     views = models.BigIntegerField(default=0)
     likes = models.BigIntegerField(default=0)
     comments = models.BigIntegerField(default=0)
+    scored_comments = models.BigIntegerField(
+        default=0,
+        help_text="Comments that count toward competition scoring.",
+    )
     shares = models.BigIntegerField(default=0)
     brand_mention_comments = models.PositiveIntegerField(default=0)
     engagement_score = models.FloatField(default=0)
     last_synced_at = models.DateTimeField(null=True, blank=True)
+    platform_published_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the video was published on the social platform.",
+    )
+    is_competition_eligible = models.BooleanField(
+        default=False,
+        help_text="True when published within the competition live window.",
+    )
+    ineligibility_reason = models.CharField(max_length=40, blank=True, default="")
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -153,25 +273,6 @@ class CompetitionVideo(models.Model):
 
     def __str__(self) -> str:
         return self.url
-
-
-class TikTokConnection(models.Model):
-    candidate_profile = models.OneToOneField(
-        CandidateProfile,
-        on_delete=models.CASCADE,
-        related_name="tiktok_connection",
-    )
-    open_id = models.CharField(max_length=120, blank=True, default="")
-    access_token = models.TextField(blank=True, default="")
-    refresh_token = models.TextField(blank=True, default="")
-    access_token_expires_at = models.DateTimeField(null=True, blank=True)
-    refresh_token_expires_at = models.DateTimeField(null=True, blank=True)
-    scope = models.CharField(max_length=255, blank=True, default="")
-    connected_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    def __str__(self) -> str:
-        return f"TikTok @ {self.candidate_profile}"
 
 
 class VideoComment(models.Model):

@@ -1,5 +1,6 @@
 import os
 import ssl
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -65,13 +66,26 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "voteme_api.wsgi.application"
 
-required_db_vars = ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT")
-missing_db_vars = [var for var in required_db_vars if not os.environ.get(var)]
-if missing_db_vars:
-    raise ValueError(
-        f"Missing database env vars: {', '.join(missing_db_vars)}. "
-        "Set them in BackEnd/venv/.env"
-    )
+USE_SQLITE = (
+    os.environ.get("USE_SQLITE_TEST", "").lower() == "true"
+    or "test" in sys.argv
+)
+
+if USE_SQLITE:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": ":memory:",
+        }
+    }
+else:
+    required_db_vars = ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT")
+    missing_db_vars = [var for var in required_db_vars if not os.environ.get(var)]
+    if missing_db_vars:
+        raise ValueError(
+            f"Missing database env vars: {', '.join(missing_db_vars)}. "
+            "Set them in BackEnd/venv/.env"
+        )
 
 def _mysql_ssl_context() -> ssl.SSLContext:
     """Aiven MySQL uses TLS; allow connection without local CA bundle in dev."""
@@ -82,21 +96,29 @@ def _mysql_ssl_context() -> ssl.SSLContext:
     return context
 
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.mysql",
-        "NAME": os.environ["DB_NAME"],
-        "USER": os.environ["DB_USER"],
-        "PASSWORD": os.environ["DB_PASSWORD"],
-        "HOST": os.environ["DB_HOST"],
-        "PORT": os.environ["DB_PORT"],
-        # Aiven free tiers have low connection limits; avoid pooling in dev.
-        "CONN_MAX_AGE": int(os.environ.get("DB_CONN_MAX_AGE", "0")),
-        "OPTIONS": {
-            "charset": "utf8mb4",
-            "ssl": _mysql_ssl_context(),
+if not USE_SQLITE:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.mysql",
+            "NAME": os.environ["DB_NAME"],
+            "USER": os.environ["DB_USER"],
+            "PASSWORD": os.environ["DB_PASSWORD"],
+            "HOST": os.environ["DB_HOST"],
+            "PORT": os.environ["DB_PORT"],
+            # Aiven free tiers have low connection limits; avoid pooling in dev.
+            "CONN_MAX_AGE": int(os.environ.get("DB_CONN_MAX_AGE", "0")),
+            "OPTIONS": {
+                "charset": "utf8mb4",
+                "ssl": _mysql_ssl_context(),
+            },
         },
-    },
+    }
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "voteme-default",
+    }
 }
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -150,33 +172,5 @@ CORS_ALLOWED_ORIGINS = [
 PUBLIC_SIGNUP_ENABLED = os.environ.get("PUBLIC_SIGNUP_ENABLED", "false").lower() == "true"
 SIGNUP_SECRET_CODE = os.environ.get("SIGNUP_SECRET_CODE", "")
 
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        "LOCATION": "voteme-default",
-    }
-}
-
-# TikTok Login Kit + Display API
-TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
-TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
-TIKTOK_REDIRECT_URI = os.environ.get(
-    "TIKTOK_REDIRECT_URI",
-    "http://localhost:3000/dashboard/tiktok/callback",
-)
-# desktop = http://localhost + PKCE (hex SHA256). web = https redirect, no PKCE.
-_tiktok_login_kit = os.environ.get("TIKTOK_LOGIN_KIT", "").strip().lower()
-if _tiktok_login_kit in ("desktop", "web"):
-    TIKTOK_LOGIN_KIT = _tiktok_login_kit
-elif TIKTOK_REDIRECT_URI.lower().startswith("http://"):
-    TIKTOK_LOGIN_KIT = "desktop"
-else:
-    TIKTOK_LOGIN_KIT = "web"
-TIKTOK_SCOPES = os.environ.get("TIKTOK_SCOPES", "user.info.basic,video.list")
-
 # Brand mention keyword for comment scoring (case-insensitive)
 BRAND_MENTION_KEYWORD = os.environ.get("BRAND_MENTION_KEYWORD", "ellaresort")
-
-# Optional TikTok Research API (academic) for comment text ingestion
-TIKTOK_RESEARCH_CLIENT_KEY = os.environ.get("TIKTOK_RESEARCH_CLIENT_KEY", "")
-TIKTOK_RESEARCH_CLIENT_SECRET = os.environ.get("TIKTOK_RESEARCH_CLIENT_SECRET", "")

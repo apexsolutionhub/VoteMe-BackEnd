@@ -1,110 +1,99 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from django.db.models import Max, Sum
-from django.db.models.functions import TruncHour
 from django.utils import timezone
 
-from competitions.models import CandidateProfile, Competition, EngagementSnapshot, TikTokConnection
+from competitions.criteria import _legacy_achievements, build_criteria_achievements
+from competitions.models import CandidateProfile, Competition, EngagementSnapshot
 
 
-def _video_label(url: str, video_id: int) -> str:
+def _video_label(video) -> str:
+    title = (getattr(video, "title", None) or "").strip()
+    if title:
+        return title if len(title) <= 48 else f"{title[:45]}..."
+    url = getattr(video, "url", "")
+    video_id = getattr(video, "id", 0)
     cleaned = url.rstrip("/").split("/")[-1]
     if cleaned and len(cleaned) <= 24:
         return cleaned
     return f"Video #{video_id}"
 
 
-def _build_achievements(
-    profile: CandidateProfile,
-    totals: dict,
-    rank: int | None,
-    video_count: int,
-    tiktok_connected: bool,
-) -> list[dict]:
-    views = int(totals.get("views") or 0)
-    likes = int(totals.get("likes") or 0)
-    score = float(totals.get("engagement_score") or 0)
-    brand_mentions = int(totals.get("brand_mention_comments") or 0)
+def _build_portfolio_history(videos, history_since) -> list[dict]:
+    """
+    Total engagement across all videos at each hour where any video synced.
 
-    def milestone(
-        id: str,
-        title: str,
-        description: str,
-        unlocked: bool,
-        *,
-        current: int | float | None = None,
-        target: int | float | None = None,
-    ) -> dict:
-        item = {
-            "id": id,
-            "title": title,
-            "description": description,
-            "unlocked": unlocked,
+    Uses the latest snapshot per video up to each bucket so partial syncs do
+    not make totals look like they crashed.
+    """
+    snapshots = list(
+        EngagementSnapshot.objects.filter(
+            video__in=videos,
+            captured_at__gte=history_since,
+        ).order_by("captured_at")
+    )
+    if not snapshots:
+        return []
+
+    video_ids = list(videos.values_list("id", flat=True))
+    buckets = sorted(
+        {
+            snap.captured_at.replace(minute=0, second=0, microsecond=0)
+            for snap in snapshots
         }
-        if current is not None and target is not None and target > 0:
-            item["current"] = current
-            item["target"] = target
-            item["progress"] = min(100, round((current / target) * 100))
-        return item
+    )
 
-    achievements = [
-        milestone(
-            "profile_complete",
-            "Profile ready",
-            "Complete your candidate profile to join the competition.",
-            profile.is_profile_complete,
-        ),
-        milestone(
-            "first_video",
-            "First video live",
-            "Submit at least one competition video.",
-            video_count >= 1,
-            current=video_count,
-            target=1,
-        ),
-        milestone(
-            "tiktok_connected",
-            "TikTok connected",
-            "Link TikTok for automatic engagement sync.",
-            tiktok_connected,
-        ),
-        milestone(
-            "views_100",
-            "100 views",
-            "Reach 100 total video views.",
-            views >= 100,
-            current=views,
-            target=100,
-        ),
-        milestone(
-            "views_1k",
-            "1K views",
-            "Reach 1,000 total video views.",
-            views >= 1000,
-            current=views,
-            target=1000,
-        ),
-        milestone(
-            "likes_50",
-            "50 likes",
-            "Collect 50 likes across your videos.",
-            likes >= 50,
-            current=likes,
-            target=50,
-        ),
-        milestone(
-            "brand_mention",
-            "Ella Resort buzz",
-            "Get a comment mentioning Ella Resort.",
-            brand_mentions >= 1,
-            current=brand_mentions,
-            target=1,
-        ),
-    ]
-    return achievements
+    history: list[dict] = []
+    for bucket in buckets:
+        bucket_end = bucket + timedelta(hours=1)
+        total_views = 0
+        total_likes = 0
+        total_comments = 0
+        total_shares = 0
+        has_data = False
+
+        for video_id in video_ids:
+            latest = (
+                EngagementSnapshot.objects.filter(
+                    video_id=video_id,
+                    captured_at__lt=bucket_end,
+                )
+                .order_by("-captured_at")
+                .first()
+            )
+            if latest is None:
+                continue
+            has_data = True
+            total_views += latest.views
+            total_likes += latest.likes
+            total_comments += latest.comments
+            total_shares += latest.shares
+
+        if not has_data:
+            continue
+
+        history.append(
+            {
+                "captured_at": bucket.isoformat(),
+                "label": bucket.strftime("%b %d, %H:%M"),
+                "views": total_views,
+                "likes": total_likes,
+                "comments": total_comments,
+                "shares": total_shares,
+            }
+        )
+
+    return history
 
 
-def build_candidate_analytics(profile: CandidateProfile, competition: Competition | None) -> dict:
+def build_candidate_analytics(
+    profile: CandidateProfile,
+    competition: Competition | None,
+    *,
+    rank: int | None = None,
+) -> dict:
     if competition is None:
         return {
             "totals": {
@@ -117,33 +106,33 @@ def build_candidate_analytics(profile: CandidateProfile, competition: Competitio
                 "competition_status": "draft",
                 "live_tracking_enabled": False,
                 "tracking_interval_minutes": 10,
-                "tiktok_connected": False,
             },
             "history": [],
             "videos": [],
-            "achievements": _build_achievements(profile, {}, None, 0, False),
+            "achievements": _legacy_achievements(profile, {}, 0),
             "profile_complete": profile.is_profile_complete,
             "video_count": 0,
             "unlocked_achievements": 0,
-            "total_achievements": 10,
+            "total_achievements": 0,
+            "competition_result": None,
         }
 
-    videos = profile.videos.filter(competition=competition, is_active=True)
-    video_count = videos.count()
+    eligible_videos = profile.videos.filter(
+        competition=competition,
+        is_active=True,
+        is_competition_eligible=True,
+    )
+    video_count = eligible_videos.count()
 
-    totals_agg = videos.aggregate(
+    totals_agg = eligible_videos.aggregate(
         views=Sum("views"),
         likes=Sum("likes"),
-        comments=Sum("comments"),
+        comments=Sum("scored_comments"),
         shares=Sum("shares"),
         brand_mention_comments=Sum("brand_mention_comments"),
         engagement_score=Sum("engagement_score"),
         last_synced_at=Max("last_synced_at"),
     )
-
-    tiktok_connected = TikTokConnection.objects.filter(
-        candidate_profile=profile
-    ).exists()
 
     totals = {
         "views": totals_agg["views"] or 0,
@@ -155,35 +144,10 @@ def build_candidate_analytics(profile: CandidateProfile, competition: Competitio
         "competition_status": competition.status,
         "live_tracking_enabled": competition.live_tracking_enabled,
         "tracking_interval_minutes": competition.tracking_interval_minutes,
-        "tiktok_connected": tiktok_connected,
     }
 
-    history_qs = (
-        EngagementSnapshot.objects.filter(video__in=videos)
-        .annotate(bucket=TruncHour("captured_at"))
-        .values("bucket")
-        .annotate(
-            views=Sum("views"),
-            likes=Sum("likes"),
-            comments=Sum("comments"),
-            shares=Sum("shares"),
-            engagement_score=Sum("engagement_score"),
-        )
-        .order_by("bucket")
-    )
-
-    history = [
-        {
-            "captured_at": row["bucket"].isoformat() if row["bucket"] else None,
-            "label": row["bucket"].strftime("%b %d, %H:%M") if row["bucket"] else "",
-            "views": row["views"] or 0,
-            "likes": row["likes"] or 0,
-            "comments": row["comments"] or 0,
-            "shares": row["shares"] or 0,
-        }
-        for row in history_qs
-        if row["bucket"] is not None
-    ]
+    history_since = timezone.now() - timedelta(days=7)
+    history = _build_portfolio_history(eligible_videos, history_since)
 
     if not history and video_count > 0:
         now = timezone.now()
@@ -202,21 +166,43 @@ def build_candidate_analytics(profile: CandidateProfile, competition: Competitio
         {
             "id": video.id,
             "url": video.url,
-            "label": _video_label(video.url, video.id),
+            "label": _video_label(video),
+            "title": video.title,
             "views": video.views,
             "likes": video.likes,
             "comments": video.comments,
             "shares": video.shares,
             "brand_mention_comments": video.brand_mention_comments,
             "last_synced_at": video.last_synced_at,
+            "platform_published_at": video.platform_published_at,
+            "is_competition_eligible": video.is_competition_eligible,
+            "ineligibility_reason": video.ineligibility_reason,
         }
-        for video in videos.order_by("-views", "-updated_at")
+        for video in eligible_videos.order_by("-views", "-updated_at")
     ]
 
-    achievements = _build_achievements(
-        profile, totals, None, video_count, tiktok_connected
+    totals["engagement_score"] = totals_agg["engagement_score"] or 0
+    achievements = build_criteria_achievements(
+        competition,
+        profile,
+        totals,
+        video_count=video_count,
+        rank=rank,
     )
     unlocked = sum(1 for item in achievements if item["unlocked"])
+
+    competition_result = None
+    if (
+        competition is not None
+        and competition.status == Competition.Status.ENDED
+        and rank is not None
+    ):
+        competition_result = {
+            "rank": rank,
+            "engagement_score": float(totals.get("engagement_score") or 0),
+            "visible": True,
+            "on_podium": rank <= 3,
+        }
 
     return {
         "totals": totals,
@@ -227,4 +213,5 @@ def build_candidate_analytics(profile: CandidateProfile, competition: Competitio
         "video_count": video_count,
         "unlocked_achievements": unlocked,
         "total_achievements": len(achievements),
+        "competition_result": competition_result,
     }

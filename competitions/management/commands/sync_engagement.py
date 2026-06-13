@@ -14,7 +14,8 @@ class Command(BaseCommand):
         )
         total = 0
         for competition in competitions:
-            synced = sync_competition_videos(competition)
+            result = sync_competition_videos(competition)
+            synced = result["synced_count"]
             total += synced
             self.stdout.write(
                 self.style.SUCCESS(

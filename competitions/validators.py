@@ -6,6 +6,7 @@ from rest_framework import serializers
 PLATFORM_HOST_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     "tiktok": [
         re.compile(r"^(?:www\.)?tiktok\.com$", re.I),
+        re.compile(r"^(?:www\.)?m\.tiktok\.com$", re.I),
         re.compile(r"^vm\.tiktok\.com$", re.I),
         re.compile(r"^vt\.tiktok\.com$", re.I),
     ],
@@ -26,6 +27,8 @@ PLATFORM_HOST_PATTERNS: dict[str, list[re.Pattern[str]]] = {
 VIDEO_PATH_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     "tiktok": [
         re.compile(r"/@[^/]+/video/\d+", re.I),
+        re.compile(r"^/video/\d+", re.I),
+        re.compile(r"^/v/\d+(?:\.html)?$", re.I),
         re.compile(r"^/t/[A-Za-z0-9]+", re.I),
     ],
     "youtube": [
@@ -107,7 +110,11 @@ def validate_competition_video_url(url: str, platform: str) -> str:
 
     path = parsed.path or "/"
 
-    if platform == "tiktok" and host in {"vm.tiktok.com", "vt.tiktok.com"}:
+    if platform == "tiktok" and host in {
+        "vm.tiktok.com",
+        "vt.tiktok.com",
+        "m.tiktok.com",
+    }:
         return normalized
 
     patterns = VIDEO_PATH_PATTERNS.get(platform, [])
@@ -127,6 +134,9 @@ def extract_video_id(url: str, platform: str) -> str:
         match = re.search(r"/video/(\d+)", path)
         if match:
             return match.group(1)
+        mobile = re.search(r"/v/(\d+)", path)
+        if mobile:
+            return mobile.group(1)
         short = re.search(r"/t/([A-Za-z0-9]+)", path)
         if short:
             return short.group(1)

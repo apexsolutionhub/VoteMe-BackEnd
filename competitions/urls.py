@@ -1,17 +1,16 @@
 from django.urls import path
 
-from .tiktok_views import (
-    TikTokCallbackView,
-    TikTokConnectView,
-    TikTokDisconnectView,
-    TikTokStatusView,
-)
 from .views import (
+    AdminCompetitionStandingsView,
+    AdminLeaderboardView,
     CandidateAnalyticsView,
     CandidateMeProfileView,
     CandidateStatsView,
     CandidateVideoDetailView,
     CandidateVideoListCreateView,
+    CandidateVideoSyncView,
+    CompetitionCriterionDetailView,
+    CompetitionCriterionListCreateView,
     CompetitionStatusView,
     OrgCandidateDetailView,
     OrgCandidateListCreateView,
@@ -20,7 +19,6 @@ from .views import (
     PublicCompetitionView,
     PublicLeaderboardView,
     SyncCompetitionView,
-    AdminLeaderboardView,
 )
 
 urlpatterns = [
@@ -39,6 +37,21 @@ urlpatterns = [
         "organizations/competition/sync/",
         SyncCompetitionView.as_view(),
         name="competition-sync",
+    ),
+    path(
+        "organizations/competition/criteria/",
+        CompetitionCriterionListCreateView.as_view(),
+        name="competition-criteria",
+    ),
+    path(
+        "organizations/competition/criteria/<int:pk>/",
+        CompetitionCriterionDetailView.as_view(),
+        name="competition-criterion-detail",
+    ),
+    path(
+        "organizations/competition/standings/",
+        AdminCompetitionStandingsView.as_view(),
+        name="organization-competition-standings",
     ),
     path(
         "organizations/leaderboard/",
@@ -68,14 +81,15 @@ urlpatterns = [
         name="candidate-videos",
     ),
     path(
+        "candidate/me/videos/<int:pk>/sync/",
+        CandidateVideoSyncView.as_view(),
+        name="candidate-video-sync",
+    ),
+    path(
         "candidate/me/videos/<int:pk>/",
         CandidateVideoDetailView.as_view(),
         name="candidate-video-detail",
     ),
-    path("tiktok/connect/", TikTokConnectView.as_view(), name="tiktok-connect"),
-    path("tiktok/callback/", TikTokCallbackView.as_view(), name="tiktok-callback"),
-    path("tiktok/status/", TikTokStatusView.as_view(), name="tiktok-status"),
-    path("tiktok/disconnect/", TikTokDisconnectView.as_view(), name="tiktok-disconnect"),
     path(
         "public/<slug:org_slug>/competition/",
         PublicCompetitionView.as_view(),

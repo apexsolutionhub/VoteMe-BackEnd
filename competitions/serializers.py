@@ -1,9 +1,16 @@
 from django.contrib.auth.password_validation import validate_password
+from django.db.models import Q
 from rest_framework import serializers
 
 from accounts.models import User
 from accounts.serializers import UserSerializer
-from competitions.models import CandidateProfile, Competition, CompetitionVideo
+from competitions.models import (
+    CandidateProfile,
+    Competition,
+    CompetitionCriterion,
+    CompetitionVideo,
+)
+from competitions.comment_mentions import normalize_comment_match_terms
 from competitions.validators import (
     extract_video_id,
     validate_competition_video_url,
@@ -13,6 +20,8 @@ from organizations.models import OrganizationMember
 
 
 class CompetitionSerializer(serializers.ModelSerializer):
+    comment_scoring_approximate = serializers.SerializerMethodField()
+
     class Meta:
         model = Competition
         fields = (
@@ -27,12 +36,46 @@ class CompetitionSerializer(serializers.ModelSerializer):
             "status",
             "live_tracking_enabled",
             "tracking_interval_minutes",
+            "comment_scoring_mode",
+            "comment_match_terms",
+            "comment_scoring_approximate",
             "start_at",
             "end_at",
             "created_at",
             "updated_at",
         )
-        read_only_fields = ("id", "created_at", "updated_at")
+        read_only_fields = ("id", "created_at", "updated_at", "comment_scoring_approximate")
+
+    def get_comment_scoring_approximate(self, obj: Competition) -> bool:
+        if not obj.uses_matched_comment_scoring():
+            return False
+        from competitions.models import VideoComment
+
+        return not VideoComment.objects.filter(
+            video__competition=obj,
+            video__is_active=True,
+        ).exists()
+
+    def validate_comment_match_terms(self, value):
+        return normalize_comment_match_terms(value)
+
+    def validate(self, attrs):
+        mode = attrs.get(
+            "comment_scoring_mode",
+            getattr(self.instance, "comment_scoring_mode", Competition.CommentScoringMode.ALL),
+        )
+        terms = attrs.get(
+            "comment_match_terms",
+            getattr(self.instance, "comment_match_terms", []),
+        )
+        if isinstance(terms, str):
+            terms = normalize_comment_match_terms(terms)
+            attrs["comment_match_terms"] = terms
+
+        if mode == Competition.CommentScoringMode.MATCHED and not terms:
+            attrs["comment_scoring_mode"] = Competition.CommentScoringMode.ALL
+            attrs["comment_match_terms"] = []
+        return attrs
 
 
 class CandidateProfileSerializer(serializers.ModelSerializer):
@@ -66,6 +109,9 @@ class CandidateProfileSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "is_profile_complete", "created_at", "updated_at")
 
     def get_video_count(self, obj) -> int:
+        annotated = getattr(obj, "video_count", None)
+        if annotated is not None:
+            return int(annotated)
         return obj.videos.filter(is_active=True).count()
 
     def _get_platform(self, instance: CandidateProfile) -> str:
@@ -120,12 +166,16 @@ class CompetitionVideoSerializer(serializers.ModelSerializer):
             "id",
             "url",
             "platform_video_id",
+            "title",
             "views",
             "likes",
             "comments",
             "shares",
             "engagement_score",
             "last_synced_at",
+            "platform_published_at",
+            "is_competition_eligible",
+            "ineligibility_reason",
             "is_active",
             "created_at",
             "updated_at",
@@ -133,46 +183,114 @@ class CompetitionVideoSerializer(serializers.ModelSerializer):
         read_only_fields = (
             "id",
             "platform_video_id",
+            "title",
             "views",
             "likes",
             "comments",
             "shares",
             "engagement_score",
             "last_synced_at",
+            "platform_published_at",
+            "is_competition_eligible",
+            "ineligibility_reason",
             "created_at",
             "updated_at",
         )
 
     def validate_url(self, value):
         competition = self.context["competition"]
-        normalized = validate_competition_video_url(value, competition.social_platform)
-        if CompetitionVideo.objects.filter(
+        profile = self.context["candidate_profile"]
+        platform = competition.social_platform
+        normalized = validate_competition_video_url(value, platform)
+        video_id = extract_video_id(normalized, platform)
+
+        active_duplicates = CompetitionVideo.objects.filter(
             competition=competition,
-            url=normalized,
-        ).exclude(pk=getattr(self.instance, "pk", None)).exists():
+            is_active=True,
+        ).exclude(pk=getattr(self.instance, "pk", None))
+        if active_duplicates.filter(url=normalized).exists() or (
+            video_id and active_duplicates.filter(platform_video_id=video_id).exists()
+        ):
             raise serializers.ValidationError("This video is already registered.")
+
+        inactive_match = Q(url=normalized)
+        if video_id:
+            inactive_match |= Q(platform_video_id=video_id)
+        owned_by_other = (
+            CompetitionVideo.objects.filter(competition=competition)
+            .filter(inactive_match)
+            .exclude(candidate_profile=profile)
+            .exists()
+        )
+        if owned_by_other:
+            raise serializers.ValidationError("This video is already registered.")
+
         return normalized
+
+    def _reactivate_video(
+        self,
+        video: CompetitionVideo,
+        *,
+        url: str,
+        platform_video_id: str,
+    ) -> CompetitionVideo:
+        video.is_active = True
+        video.url = url
+        video.platform_video_id = platform_video_id or video.platform_video_id
+        video.title = ""
+        video.views = 0
+        video.likes = 0
+        video.comments = 0
+        video.scored_comments = 0
+        video.shares = 0
+        video.brand_mention_comments = 0
+        video.engagement_score = 0
+        video.last_synced_at = None
+        video.platform_published_at = None
+        video.save()
+        evaluate_video_eligibility(video, persist=True)
+        return video
 
     def create(self, validated_data):
         competition = self.context["competition"]
         profile = self.context["candidate_profile"]
         url = validated_data["url"]
         video_id = extract_video_id(url, competition.social_platform)
+
+        inactive_match = Q(url=url)
+        if video_id:
+            inactive_match |= Q(platform_video_id=video_id)
+
+        existing = (
+            CompetitionVideo.objects.filter(
+                competition=competition,
+                candidate_profile=profile,
+                is_active=False,
+            )
+            .filter(inactive_match)
+            .first()
+        )
+        if existing:
+            return self._reactivate_video(
+                existing,
+                url=url,
+                platform_video_id=video_id,
+            )
+
         video = CompetitionVideo.objects.create(
             competition=competition,
             candidate_profile=profile,
             url=url,
             platform_video_id=video_id,
         )
-        from competitions.sync import sync_video_metrics
-
-        sync_video_metrics(video)
-        video.refresh_from_db()
+        evaluate_video_eligibility(video, persist=True)
         return video
 
 
 class CandidateCompetitionVideoSerializer(serializers.ModelSerializer):
     """Candidate-facing video payload — excludes engagement score."""
+
+    sync_status = serializers.SerializerMethodField()
 
     class Meta:
         model = CompetitionVideo
@@ -180,14 +298,24 @@ class CandidateCompetitionVideoSerializer(serializers.ModelSerializer):
             "id",
             "url",
             "platform_video_id",
+            "title",
             "views",
             "likes",
             "comments",
             "shares",
             "last_synced_at",
+            "platform_published_at",
+            "is_competition_eligible",
+            "ineligibility_reason",
+            "sync_status",
             "is_active",
         )
         read_only_fields = fields
+
+    def get_sync_status(self, obj: CompetitionVideo) -> str:
+        if obj.last_synced_at:
+            return "synced"
+        return "pending"
 
 
 class LeaderboardEntrySerializer(serializers.Serializer):
@@ -204,6 +332,81 @@ class LeaderboardEntrySerializer(serializers.Serializer):
     engagement_score = serializers.FloatField()
     video_count = serializers.IntegerField()
     last_synced_at = serializers.DateTimeField(allow_null=True)
+
+
+class CompetitionCriterionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CompetitionCriterion
+        fields = (
+            "id",
+            "kind",
+            "metric_key",
+            "evaluation_mode",
+            "title",
+            "description",
+            "target_value",
+            "weight_value",
+            "weight_input_type",
+            "weight_display",
+            "sort_order",
+            "is_active",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        kind = attrs.get("kind") or getattr(self.instance, "kind", None)
+        evaluation_mode = attrs.get("evaluation_mode") or getattr(
+            self.instance, "evaluation_mode", CompetitionCriterion.EvaluationMode.ABSOLUTE
+        )
+        weight_input_type = attrs.get("weight_input_type") or getattr(
+            self.instance,
+            "weight_input_type",
+            CompetitionCriterion.WeightInputType.NUMBER,
+        )
+        weight_display = attrs.get("weight_display")
+        weight_value = attrs.get("weight_value")
+
+        if kind == CompetitionCriterion.Kind.METRIC:
+            if weight_input_type == CompetitionCriterion.WeightInputType.PERCENTAGE:
+                raw = weight_display if weight_display is not None else weight_value
+                if raw is None:
+                    raise serializers.ValidationError(
+                        {"weight_display": "Enter a percentage such as 30%."}
+                    )
+                token = str(raw).strip().replace("%", "")
+                try:
+                    attrs["weight_value"] = float(token)
+                except (TypeError, ValueError) as exc:
+                    raise serializers.ValidationError(
+                        {"weight_display": "Enter a valid percentage."}
+                    ) from exc
+                attrs["weight_display"] = f"{attrs['weight_value']:.0f}%"
+            elif weight_input_type == CompetitionCriterion.WeightInputType.WORD:
+                if not (weight_display or "").strip():
+                    raise serializers.ValidationError(
+                        {"weight_display": "Enter a weight word such as high or medium."}
+                    )
+            elif weight_value is None:
+                raise serializers.ValidationError(
+                    {"weight_value": "Enter a numeric weight."}
+                )
+
+        if kind == CompetitionCriterion.Kind.MILESTONE:
+            if evaluation_mode == CompetitionCriterion.EvaluationMode.ABSOLUTE:
+                metric_key = attrs.get("metric_key") or getattr(
+                    self.instance, "metric_key", None
+                )
+                if (
+                    metric_key != CompetitionCriterion.MetricKey.PROFILE_COMPLETE
+                    and attrs.get("target_value") is None
+                    and getattr(self.instance, "target_value", None) is None
+                ):
+                    raise serializers.ValidationError(
+                        {"target_value": "Absolute milestones need a target value."}
+                    )
+        return attrs
 
 
 class PublicCompetitionSerializer(serializers.ModelSerializer):

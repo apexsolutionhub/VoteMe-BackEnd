@@ -1,4 +1,4 @@
-from django.db.models import Max, Sum
+from django.db.models import Count, Max, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, status
@@ -7,15 +7,22 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.serializers import UserSerializer
+from competitions.criteria import ensure_default_criteria
+from competitions.leaderboard import (
+    build_leaderboard,
+    build_leaderboard_response,
+    invalidate_public_leaderboard_cache,
+)
 from competitions.models import (
     CandidateProfile,
     Competition,
+    CompetitionCriterion,
     CompetitionVideo,
-    TikTokConnection,
 )
 from competitions.serializers import (
     CandidateCompetitionVideoSerializer,
     CandidateProfileSerializer,
+    CompetitionCriterionSerializer,
     CompetitionSerializer,
     CompetitionVideoSerializer,
     CreateCandidateSerializer,
@@ -23,63 +30,18 @@ from competitions.serializers import (
     PublicCompetitionSerializer,
 )
 from competitions.analytics import build_candidate_analytics
-from competitions.sync import sync_competition_videos, sync_video_metrics
+from competitions.eligibility import reevaluate_competition_videos
+from competitions.standings import build_competition_standings
+from competitions.sync import (
+    enqueue_video_sync,
+    recompute_competition_comment_scores,
+    sync_competition_videos,
+    sync_video_metrics,
+)
 from organizations.mixins import TenantViewMixin
 from organizations.models import Organization, OrganizationMember
 from organizations.permissions import IsOrgAdmin, IsOrgCandidate
 from organizations.serializers import OrganizationSerializer
-
-
-def build_leaderboard(competition: Competition) -> list[dict]:
-    profiles = (
-        CandidateProfile.objects.filter(organization=competition.organization)
-        .select_related("user")
-        .prefetch_related("videos")
-    )
-
-    entries = []
-    for profile in profiles:
-        videos = profile.videos.filter(competition=competition, is_active=True)
-        if not videos.exists():
-            continue
-
-        totals = videos.aggregate(
-            views=Sum("views"),
-            likes=Sum("likes"),
-            comments=Sum("comments"),
-            shares=Sum("shares"),
-            engagement_score=Sum("engagement_score"),
-            last_synced_at=Max("last_synced_at"),
-        )
-
-        name = (
-            f"{profile.user.first_name} {profile.user.last_name}".strip()
-            or profile.user.username
-        )
-        initials = "".join(part[0].upper() for part in name.split()[:2]) or "?"
-
-        entries.append(
-            {
-                "candidate_id": profile.id,
-                "name": name,
-                "username": profile.user.username,
-                "initials": initials,
-                "profile_image_url": profile.profile_image_url,
-                "views": totals["views"] or 0,
-                "likes": totals["likes"] or 0,
-                "comments": totals["comments"] or 0,
-                "shares": totals["shares"] or 0,
-                "engagement_score": float(totals["engagement_score"] or 0),
-                "video_count": videos.count(),
-                "last_synced_at": totals["last_synced_at"],
-            }
-        )
-
-    entries.sort(key=lambda item: item["engagement_score"], reverse=True)
-    for index, entry in enumerate(entries, start=1):
-        entry["rank"] = index
-
-    return entries
 
 
 class OrganizationCompetitionView(TenantViewMixin, APIView):
@@ -93,6 +55,7 @@ class OrganizationCompetitionView(TenantViewMixin, APIView):
                 {"detail": "No competition configured yet."},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        ensure_default_criteria(competition)
         return Response(CompetitionSerializer(competition).data)
 
     def patch(self, request):
@@ -103,8 +66,9 @@ class OrganizationCompetitionView(TenantViewMixin, APIView):
 
         serializer = CompetitionSerializer(competition, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(serializer.data)
+        competition = serializer.save()
+        recompute_competition_comment_scores(competition)
+        return Response(CompetitionSerializer(competition).data)
 
 
 class CompetitionStatusView(TenantViewMixin, APIView):
@@ -130,6 +94,8 @@ class CompetitionStatusView(TenantViewMixin, APIView):
         if new_status == Competition.Status.ENDED and competition.end_at is None:
             competition.end_at = timezone.now()
         competition.save()
+        reevaluate_competition_videos(competition)
+        invalidate_public_leaderboard_cache(organization.slug)
         return Response(CompetitionSerializer(competition).data)
 
 
@@ -145,16 +111,30 @@ class SyncCompetitionView(TenantViewMixin, APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        synced = sync_competition_videos(competition)
+        result = sync_competition_videos(competition, force=True)
         leaderboard = build_leaderboard(competition)
-        return Response(
-            {
-                "detail": f"Synced {synced} videos.",
-                "synced_count": synced,
-                "leaderboard": LeaderboardEntrySerializer(leaderboard, many=True).data,
-                "last_synced_at": timezone.now(),
-            }
-        )
+        synced = result["synced_count"]
+        failed = result["failed_count"]
+        attempted = result["attempted_count"]
+        payload = {
+            "detail": f"Synced {synced} videos.",
+            "synced_count": synced,
+            "failed_count": failed,
+            "attempted_count": attempted,
+            "leaderboard": LeaderboardEntrySerializer(leaderboard, many=True).data,
+            "last_synced_at": timezone.now(),
+        }
+        if attempted and synced == 0:
+            payload["sync_warning"] = (
+                "No fresh TikTok metrics could be fetched. "
+                "Try again in a minute or use Sync on individual videos."
+            )
+        elif failed:
+            payload["sync_warning"] = (
+                f"{failed} video(s) could not be refreshed from TikTok."
+            )
+        invalidate_public_leaderboard_cache(organization.slug)
+        return Response(payload)
 
 
 class OrgCandidateListCreateView(TenantViewMixin, generics.ListCreateAPIView):
@@ -164,7 +144,14 @@ class OrgCandidateListCreateView(TenantViewMixin, generics.ListCreateAPIView):
         organization = self.get_organization()
         return (
             CandidateProfile.objects.filter(organization=organization)
-            .select_related("user")
+            .select_related("user", "organization")
+            .annotate(
+                video_count=Count(
+                    "videos",
+                    filter=Q(videos__is_active=True),
+                    distinct=True,
+                )
+            )
             .order_by("-created_at")
         )
 
@@ -261,14 +248,10 @@ class CandidateVideoListCreateView(TenantViewMixin, APIView):
         profile, competition = self.get_context()
         if competition is None:
             return Response([])
-        videos = list(
-            profile.videos.filter(competition=competition, is_active=True).order_by(
-                "-updated_at"
-            )
-        )
-        for video in videos:
-            sync_video_metrics(video)
-            video.refresh_from_db()
+        videos = profile.videos.filter(
+            competition=competition,
+            is_active=True,
+        ).order_by("-updated_at")
         return Response(CandidateCompetitionVideoSerializer(videos, many=True).data)
 
     def post(self, request):
@@ -288,10 +271,45 @@ class CandidateVideoListCreateView(TenantViewMixin, APIView):
         )
         serializer.is_valid(raise_exception=True)
         video = serializer.save()
+        enqueue_video_sync(video.id, force=True)
         return Response(
             CandidateCompetitionVideoSerializer(video).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class CandidateVideoSyncView(TenantViewMixin, APIView):
+    permission_classes = [IsAuthenticated, IsOrgCandidate]
+
+    def post(self, request, pk):
+        organization = self.get_organization()
+        profile = get_object_or_404(
+            CandidateProfile,
+            user=request.user,
+            organization=organization,
+        )
+        video = get_object_or_404(
+            CompetitionVideo,
+            pk=pk,
+            candidate_profile=profile,
+            is_active=True,
+        )
+        metrics_updated = sync_video_metrics(video, force=True)
+        video.refresh_from_db()
+        payload = CandidateCompetitionVideoSerializer(video).data
+        payload["metrics_updated"] = metrics_updated
+        if not metrics_updated:
+            platform = video.competition.social_platform
+            if platform != Competition.SocialPlatform.TIKTOK:
+                payload["sync_warning"] = (
+                    f"Live metric refresh is not implemented for {platform} yet."
+                )
+            else:
+                payload["sync_warning"] = (
+                    "Could not fetch fresh TikTok metrics right now. "
+                    "Try again in a minute."
+                )
+        return Response(payload)
 
 
 class CandidateVideoDetailView(TenantViewMixin, APIView):
@@ -311,7 +329,7 @@ class CandidateVideoDetailView(TenantViewMixin, APIView):
         )
         video.is_active = False
         video.save(update_fields=["is_active", "updated_at"])
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response({"detail": "Video removed."}, status=status.HTTP_200_OK)
 
 
 class CandidateStatsView(TenantViewMixin, APIView):
@@ -337,27 +355,22 @@ class CandidateStatsView(TenantViewMixin, APIView):
                     "competition_status": "draft",
                     "live_tracking_enabled": False,
                     "tracking_interval_minutes": 10,
-                    "tiktok_connected": False,
                 }
             )
 
-        videos = list(profile.videos.filter(competition=competition, is_active=True))
-        for video in videos:
-            sync_video_metrics(video)
-
-        videos = profile.videos.filter(competition=competition, is_active=True)
+        videos = profile.videos.filter(
+            competition=competition,
+            is_active=True,
+            is_competition_eligible=True,
+        )
         totals = videos.aggregate(
             views=Sum("views"),
             likes=Sum("likes"),
-            comments=Sum("comments"),
+            comments=Sum("scored_comments"),
             shares=Sum("shares"),
             brand_mention_comments=Sum("brand_mention_comments"),
             last_synced_at=Max("last_synced_at"),
         )
-        tiktok_connected = TikTokConnection.objects.filter(
-            candidate_profile=profile
-        ).exists()
-
         return Response(
             {
                 "views": totals["views"] or 0,
@@ -369,7 +382,6 @@ class CandidateStatsView(TenantViewMixin, APIView):
                 "competition_status": competition.status,
                 "live_tracking_enabled": competition.live_tracking_enabled,
                 "tracking_interval_minutes": competition.tracking_interval_minutes,
-                "tiktok_connected": tiktok_connected,
             }
         )
 
@@ -385,11 +397,70 @@ class CandidateAnalyticsView(TenantViewMixin, APIView):
             organization=organization,
         )
         competition = organization.competitions.order_by("-created_at").first()
-        if competition:
-            videos = profile.videos.filter(competition=competition, is_active=True)
-            for video in videos:
-                sync_video_metrics(video)
-        return Response(build_candidate_analytics(profile, competition))
+        rank = None
+        if competition is not None:
+            ensure_default_criteria(competition)
+            for entry in build_leaderboard(competition):
+                if entry["candidate_id"] == profile.id:
+                    rank = entry["rank"]
+                    break
+        return Response(build_candidate_analytics(profile, competition, rank=rank))
+
+
+class CompetitionCriterionListCreateView(TenantViewMixin, APIView):
+    permission_classes = [IsAuthenticated, IsOrgAdmin]
+
+    def get_competition(self, organization: Organization) -> Competition:
+        competition = organization.competitions.order_by("-created_at").first()
+        if competition is None:
+            competition = Competition.objects.create(organization=organization)
+        ensure_default_criteria(competition)
+        return competition
+
+    def get(self, request):
+        organization = self.get_organization()
+        competition = self.get_competition(organization)
+        criteria = competition.criteria.order_by("sort_order", "id")
+        return Response(CompetitionCriterionSerializer(criteria, many=True).data)
+
+    def post(self, request):
+        organization = self.get_organization()
+        competition = self.get_competition(organization)
+        serializer = CompetitionCriterionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        criterion = serializer.save(competition=competition)
+        return Response(
+            CompetitionCriterionSerializer(criterion).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class CompetitionCriterionDetailView(TenantViewMixin, APIView):
+    permission_classes = [IsAuthenticated, IsOrgAdmin]
+
+    def get_object(self, organization: Organization, pk: int) -> CompetitionCriterion:
+        competition = organization.competitions.order_by("-created_at").first()
+        if competition is None:
+            raise Competition.DoesNotExist
+        return get_object_or_404(CompetitionCriterion, competition=competition, pk=pk)
+
+    def patch(self, request, pk: int):
+        organization = self.get_organization()
+        criterion = self.get_object(organization, pk)
+        serializer = CompetitionCriterionSerializer(
+            criterion,
+            data=request.data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, pk: int):
+        organization = self.get_organization()
+        criterion = self.get_object(organization, pk)
+        criterion.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class PublicCompetitionView(APIView):
@@ -406,6 +477,37 @@ class PublicCompetitionView(APIView):
         return Response(PublicCompetitionSerializer(competition).data)
 
 
+class AdminCompetitionStandingsView(TenantViewMixin, APIView):
+    permission_classes = [IsAuthenticated, IsOrgAdmin]
+
+    def get(self, request):
+        organization = self.get_organization()
+        competition = organization.competitions.order_by("-created_at").first()
+        if competition is None:
+            return Response(
+                {"detail": "Competition not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        standings = build_competition_standings(competition)
+        last_updated = max(
+            (
+                entry["last_synced_at"]
+                for entry in standings["candidates"]
+                if entry.get("last_synced_at")
+            ),
+            default=timezone.now(),
+        )
+        return Response(
+            {
+                "organization": OrganizationSerializer(organization).data,
+                "competition": PublicCompetitionSerializer(competition).data,
+                "standings": standings,
+                "last_updated_at": last_updated,
+            }
+        )
+
+
 class AdminLeaderboardView(TenantViewMixin, APIView):
     permission_classes = [IsAuthenticated, IsOrgAdmin]
 
@@ -418,28 +520,31 @@ class AdminLeaderboardView(TenantViewMixin, APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        if competition.live_tracking_enabled:
-            sync_competition_videos(competition)
-
-        leaderboard = build_leaderboard(competition)
-        return Response(
-            {
-                "organization": OrganizationSerializer(organization).data,
-                "competition": PublicCompetitionSerializer(competition).data,
-                "leaderboard": LeaderboardEntrySerializer(leaderboard, many=True).data,
-                "last_updated_at": timezone.now(),
-            }
-        )
+        payload = build_leaderboard_response(organization, competition)
+        return Response(payload)
 
 
 class PublicLeaderboardView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, org_slug):
-        return Response(
-            {"detail": "Leaderboard is not publicly available."},
-            status=status.HTTP_404_NOT_FOUND,
+        organization = get_object_or_404(
+            Organization,
+            slug=org_slug,
+            status=Organization.Status.ACTIVE,
         )
+        competition = organization.competitions.order_by("-created_at").first()
+        if competition is None:
+            return Response(
+                {"detail": "Competition not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        payload = build_leaderboard_response(organization, competition, use_cache=True)
+        response = Response(payload)
+        if payload.get("leaderboard_available"):
+            response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+        return response
 
 
 class OrganizationMeView(TenantViewMixin, APIView):

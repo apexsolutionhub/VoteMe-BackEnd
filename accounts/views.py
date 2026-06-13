@@ -39,7 +39,8 @@ class SignupStatusView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        return Response({"enabled": bool(settings.SIGNUP_SECRET_CODE)})
+        enabled = bool(settings.SIGNUP_SECRET_CODE) or settings.PUBLIC_SIGNUP_ENABLED
+        return Response({"enabled": enabled})
 
 
 class SignupView(APIView):

@@ -93,7 +93,7 @@ python manage.py runserver
 | `/api/candidate/me/profile/` | GET/PATCH | Candidate profile |
 | `/api/candidate/me/stats/` | GET | Candidate engagement stats |
 | `/api/candidate/me/videos/` | GET/POST | Competition video links |
-| `/api/public/<slug>/leaderboard/` | GET | Public live leaderboard |
+| `/api/public/<slug>/leaderboard/` | GET | Public results ceremony (when competition ended) |
 
 ## Engagement sync
 
@@ -101,17 +101,17 @@ python manage.py runserver
 python manage.py sync_engagement
 ```
 
-Run on a schedule (cron) for live competitions with tracking enabled.
+Run on a schedule (cron) for live competitions with tracking enabled. Example crontab entry:
+
+```cron
+*/10 * * * * cd /path/to/voteme/BackEnd && /path/to/venv/bin/python manage.py sync_engagement
+```
 
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
 | `PUBLIC_SIGNUP_ENABLED` | `true` to allow `/signup` (default `false`, invitation-only) |
-| `TIKTOK_CLIENT_KEY` | TikTok Login Kit client key |
-| `TIKTOK_CLIENT_SECRET` | TikTok client secret |
-| `TIKTOK_REDIRECT_URI` | OAuth callback (default `http://localhost:3000/dashboard/tiktok/callback`) |
 | `BRAND_MENTION_KEYWORD` | Keyword to count in comments (default `ellaresort`) |
-| `TIKTOK_RESEARCH_CLIENT_KEY` | Optional Research API for comment text ingestion |
 
 When onboarding a paid client, set `PUBLIC_SIGNUP_ENABLED=true`, send them `https://yoursite.com/signup`, then disable again after registration.

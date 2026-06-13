@@ -3,9 +3,9 @@ from django.contrib import admin
 from .models import (
     CandidateProfile,
     Competition,
+    CompetitionCriterion,
     CompetitionVideo,
     EngagementSnapshot,
-    TikTokConnection,
     VideoComment,
 )
 
@@ -14,6 +14,12 @@ from .models import (
 class CompetitionAdmin(admin.ModelAdmin):
     list_display = ("title", "organization", "social_platform", "status", "live_tracking_enabled")
     list_filter = ("status", "social_platform", "live_tracking_enabled")
+
+
+@admin.register(CompetitionCriterion)
+class CompetitionCriterionAdmin(admin.ModelAdmin):
+    list_display = ("title", "competition", "kind", "metric_key", "evaluation_mode", "is_active")
+    list_filter = ("kind", "evaluation_mode", "is_active")
 
 
 @admin.register(CandidateProfile)
@@ -31,11 +37,6 @@ class CompetitionVideoAdmin(admin.ModelAdmin):
 @admin.register(EngagementSnapshot)
 class EngagementSnapshotAdmin(admin.ModelAdmin):
     list_display = ("video", "engagement_score", "captured_at")
-
-
-@admin.register(TikTokConnection)
-class TikTokConnectionAdmin(admin.ModelAdmin):
-    list_display = ("candidate_profile", "open_id", "connected_at")
 
 
 @admin.register(VideoComment)
