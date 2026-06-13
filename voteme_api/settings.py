@@ -20,6 +20,11 @@ ALLOWED_HOSTS = [
     if host.strip()
 ]
 
+# Vercel sets VERCEL_URL per deployment (production + preview hostnames).
+vercel_url = os.environ.get("VERCEL_URL", "").strip()
+if vercel_url and vercel_url not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(vercel_url)
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
