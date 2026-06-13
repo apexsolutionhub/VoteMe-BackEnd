@@ -31,6 +31,7 @@ from competitions.serializers import (
 )
 from competitions.analytics import build_candidate_analytics
 from competitions.eligibility import reevaluate_competition_videos
+from competitions.scheduling import parse_competition_start_at
 from competitions.standings import build_competition_standings
 from competitions.sync import (
     enqueue_video_sync,
@@ -89,8 +90,18 @@ class CompetitionStatusView(TenantViewMixin, APIView):
             )
 
         competition.status = new_status
-        if new_status == Competition.Status.LIVE and competition.start_at is None:
-            competition.start_at = timezone.now()
+        if new_status == Competition.Status.LIVE:
+            start_at_raw = request.data.get("start_at")
+            if start_at_raw:
+                parsed_start = parse_competition_start_at(start_at_raw)
+                if parsed_start is None:
+                    return Response(
+                        {"detail": "Invalid start date."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                competition.start_at = parsed_start
+            elif competition.start_at is None:
+                competition.start_at = timezone.now()
         if new_status == Competition.Status.ENDED and competition.end_at is None:
             competition.end_at = timezone.now()
         competition.save()
